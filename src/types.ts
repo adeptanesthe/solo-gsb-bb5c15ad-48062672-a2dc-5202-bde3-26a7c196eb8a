@@ -1,15 +1,20 @@
 // 全局领域类型
 
-/** 一条通过 NDJSON 解析并校验后的输入事件 */
+/** 事件来源：NDJSON 输入行，或用户在缺口区补录的本地事件 */
+export type EventSource = 'input' | 'patch'
+
+/** 一条通过 NDJSON 解析并校验后的输入事件，或一条本地补录事件 */
 export interface InputEvent {
-  /** 输入框中的行号（从 1 开始，空行不参与编号，因此即文本行号） */
+  /** 输入框中的行号（从 1 开始，空行不参与编号，因此即文本行号）；本地补录事件为 0 */
   line: number
   stream: string
   sequence: number
   /** 已解析的 JSON 载荷，可以是任意 JSON 值（对象/数组/基本类型） */
   payload: JsonValue
-  /** payload 在该行对应的原始 JSON 文本，用于候选展示 */
+  /** payload 对应的原始 JSON 文本（补录事件为用户输入的文本），用于候选展示 */
   raw: string
+  /** input = NDJSON 解析得到；patch = 缺口区本地补录 */
+  source: EventSource
 }
 
 /** 可在 JSON 中出现的值 */

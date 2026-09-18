@@ -65,6 +65,7 @@ export function parseNdjson(text: string): ParseResult {
       sequence: seq,
       payload: record.payload as JsonValue,
       raw: trimmed,
+      source: 'input',
     })
   })
 

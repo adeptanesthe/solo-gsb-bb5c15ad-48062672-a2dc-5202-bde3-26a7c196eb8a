@@ -1,10 +1,11 @@
 import { useMemo, useRef, useState } from 'react'
 import type { ChangeEvent } from 'react'
-import type { ExportOrder } from './types'
+import type { ExportOrder, InputEvent } from './types'
 import { parseNdjson } from './lib/ndjson'
 import { analyzeAll, groupEvents, resolutionKey } from './lib/model'
 import { buildExport } from './lib/export'
 import { buildPlan, validatePlanText } from './lib/plan'
+import { buildPatchEvent } from './lib/patch'
 import { StreamCard } from './components/StreamCard'
 import { SAMPLE } from './sample'
 
@@ -20,6 +21,8 @@ export function App() {
   const [starts, setStarts] = useState<Record<string, number>>({})
   // 裁决映射：resolutionKey(stream, sequence) -> 选中候选的稳定 id
   const [selections, setSelections] = useState<Record<string, string>>({})
+  // 本地补录：resolutionKey(stream, sequence) -> 补录事件（line=0, source='patch'）
+  const [patches, setPatches] = useState<Record<string, InputEvent>>({})
   const [order, setOrder] = useState<ExportOrder>('stream')
   const [copied, setCopied] = useState(false)
   const [planBusy, setPlanBusy] = useState(false)
@@ -64,6 +67,8 @@ export function App() {
       }
       return next
     })
+    // 重新解析：清空全部本地补录
+    setPatches({})
     setCopied(false)
     setPlanMessage(null)
   }
@@ -78,6 +83,7 @@ export function App() {
     setParseErrors([])
     setStarts({})
     setSelections({})
+    setPatches({})
     setCopied(false)
     setPlanMessage(null)
   }
@@ -110,7 +116,41 @@ export function App() {
     setPlanMessage(null)
   }
 
-  const builds = useMemo(() => groupEvents(parsedEvents), [parsedEvents])
+  // 新增一条本地补录；校验失败时返回错误信息（由缺口编辑器就地展示），成功返回 null
+  const handleAddPatch = (
+    stream: string,
+    sequence: number,
+    rawText: string,
+  ): string | null => {
+    const key = resolutionKey(stream, sequence)
+    if (patches[key]) {
+      return `序号 #${sequence} 已有本地补录，请先撤销原补录再重新录入`
+    }
+    const result = buildPatchEvent(parsedEvents, stream, sequence, rawText)
+    if (!result.ok) return result.message
+    setPatches((prev) => ({ ...prev, [key]: result.event }))
+    setCopied(false)
+    return null
+  }
+
+  // 逐条撤销补录：移除后合并集变化，连续前缀同步回退
+  const handleRemovePatch = (stream: string, sequence: number) => {
+    setPatches((prev) => {
+      const next = { ...prev }
+      delete next[resolutionKey(stream, sequence)]
+      return next
+    })
+    setCopied(false)
+  }
+
+  // 本地补录与原始输入合并后，统一参与去重、冲突、连续前缀与导出计算；
+  // 修复方案（plan）仍只基于 parsedEvents，不含补录
+  const patchEvents = useMemo(() => Object.values(patches), [patches])
+  const mergedEvents = useMemo(
+    () => [...parsedEvents, ...patchEvents],
+    [parsedEvents, patchEvents],
+  )
+  const builds = useMemo(() => groupEvents(mergedEvents), [mergedEvents])
   const analyses = useMemo(
     () => analyzeAll(builds, starts, selections),
     [builds, starts, selections],
@@ -319,6 +359,12 @@ export function App() {
               <span className="stat-label">被阻断流</span>
             </div>
             <div className="stat">
+              <span className={`stat-num ${patchEvents.length ? 'num-ok' : ''}`}>
+                {patchEvents.length}
+              </span>
+              <span className="stat-label">本地补录</span>
+            </div>
+            <div className="stat">
               <span className="stat-num num-ok">{summary.prefixCount}</span>
               <span className="stat-label">可导出事件</span>
             </div>
@@ -328,7 +374,7 @@ export function App() {
             <div className="panel-head">
               <h2>2. 逐流检查缺口与冲突</h2>
               <p className="panel-hint">
-                选择冲突版本或撤销选择、调整起始序号后，连续前缀会立即重新计算
+                选择冲突版本或撤销选择、调整起始序号、在缺口区补录缺失事件后，连续前缀会立即重新计算
               </p>
             </div>
             <div className="stream-list">
@@ -337,9 +383,12 @@ export function App() {
                   key={a.name}
                   analysis={a}
                   selections={selections}
+                  patches={patchEvents.filter((p) => p.stream === a.name)}
                   onResolve={handleResolve}
                   onUnresolve={handleUnresolve}
                   onStartChange={handleStartChange}
+                  onAddPatch={handleAddPatch}
+                  onRemovePatch={handleRemovePatch}
                 />
               ))}
             </div>
@@ -440,6 +489,7 @@ export function App() {
             <li>同流同序号且载荷结构相同的重复项自动折叠。</li>
             <li>同流同序号但载荷结构不同 → 冲突，选择一个版本后才放行；可随时撤销。</li>
             <li>缺号或未裁决冲突会阻断该位置之后的全部事件。</li>
+            <li>缺口区可就地补录任意 JSON 载荷，补录事件与输入合并参与计算，可逐条撤销；重新解析会清空补录。</li>
             <li>导出仅包含每条流从起始序号开始的已确认连续前缀。</li>
           </ol>
         </section>

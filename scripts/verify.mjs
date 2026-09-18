@@ -11,6 +11,7 @@ import {
   sha256Hex,
   validatePlanText,
 } from '../src/lib/plan.ts'
+import { buildPatchEvent } from '../src/lib/patch.ts'
 import { PLAN_FORMAT_VERSION } from '../src/types.ts'
 
 let failures = 0
@@ -135,7 +136,57 @@ check('无确认事件时导出为空串', buildExport([], 'stream') === '')
 a1 = analyzeStream(s1, 1, { [resolutionKey('s1', 1)]: '{"v":999}' })
 check('失效裁决视为未裁决', a1.blockedByConflict && a1.prefix.length === 0)
 
+// 14b. 本地补录：缺口补录、合并重算、逐条撤销与导出口径
+{
+  // JSON 非法 -> 就地报错（错误信息含 JSON 解析原因）
+  const badJson = buildPatchEvent(events, 's1', 3, '{bad json')
+  check('补录 JSON 非法被拒', badJson.ok === false)
+  check('非法 JSON 错误信息含解析原因', badJson.message.includes('JSON'))
+
+  // 与观测事件占位冲突 -> 拒绝（s1#2 已有观测事件）
+  const occupied = buildPatchEvent(events, 's1', 2, '{"x":1}')
+  check('补录占位冲突被拒', occupied.ok === false && occupied.message.includes('#2'))
+
+  // 合法补录：缺失序号 + 任意 JSON 载荷
+  const patched = buildPatchEvent(events, 's1', 3, '{"v":3,"recovered":true}')
+  check('补录构建成功', patched.ok === true)
+  const patchEv = patched.event
+  check('补录事件标记来源', patchEv.source === 'patch' && patchEv.line === 0)
+  check('解析事件来源为 input', events.every((e) => e.source === 'input'))
+
+  // 合并后参与前缀计算：补上阻断点 #3，前缀推进到下一阻断点（此处到末尾）
+  const merged = [...events, patchEv]
+  const mergedBuilds = groupEvents(merged)
+  const aMerged = analyzeStream(mergedBuilds.get('s1'), 1, sel1)
+  check('补录后前缀推进到 #4', aMerged.prefix.map((e) => e.sequence).join() === '1,2,3,4')
+  check('补录后无阻断', !aMerged.blockedByGap && !aMerged.blockedByConflict)
+  check('补录事件进入前缀且标记来源', aMerged.prefix[2].lines[0] === 0 && aMerged.prefix[2].payload.recovered === true)
+  check('补录后缺口列表清空', aMerged.gaps.length === 0)
+  check('补录后下一期待 #5', aMerged.nextExpected === 5)
+
+  // 撤销补录 -> 连续前缀同步回退到缺号 3 阻断
+  const aReverted = analyzeStream(groupEvents(events).get('s1'), 1, sel1)
+  check(
+    '撤销补录后回退到缺号 3 阻断',
+    aReverted.blockedByGap && aReverted.blockingGap === 3 && aReverted.prefix.length === 2,
+  )
+
+  // 补录事件参与导出
+  const mergedAnalyses = analyzeAll(mergedBuilds, { s1: 1, s2: 10 }, selA)
+  const mergedRows = buildExport(mergedAnalyses, 'stream').trim().split('\n').map(JSON.parse)
+  check(
+    '导出包含补录事件',
+    mergedRows.some((r) => r.stream === 's1' && r.sequence === 3 && r.payload.recovered === true),
+  )
+  check('补录后 s1 导出 4 条', mergedRows.filter((r) => r.stream === 's1').length === 4)
+
+  // 修复方案口径不变：指纹仍只基于输入事件，补录不混入
+  check('补录不混入方案指纹', (await fingerprintEvents(merged)) !== (await fingerprintEvents(events)))
+}
+
 // 15. 修复方案：规范化与指纹
+
+
 {
   // SHA-256 已知答案（空串 / abc），同时校验与 Web Crypto 结果一致
   const enc = (s) => new TextEncoder().encode(s)

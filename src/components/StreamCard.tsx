@@ -1,13 +1,19 @@
-import type { StreamAnalysis } from '../types'
+import { useEffect, useState } from 'react'
+import type { InputEvent, StreamAnalysis } from '../types'
 import { resolutionKey } from '../lib/model'
 import { prettyJson } from '../lib/compare'
 
 interface StreamCardProps {
   analysis: StreamAnalysis
   selections: Readonly<Record<string, string>>
+  /** 当前流已保存的本地补录事件 */
+  patches: InputEvent[]
   onResolve: (stream: string, sequence: number, candidateId: string) => void
   onUnresolve: (stream: string, sequence: number) => void
   onStartChange: (stream: string, start: number) => void
+  /** 返回 null 表示保存成功，否则为就地展示的错误信息 */
+  onAddPatch: (stream: string, sequence: number, rawText: string) => string | null
+  onRemovePatch: (stream: string, sequence: number) => void
 }
 
 function linesLabel(lines: number[]): string {
@@ -24,12 +30,52 @@ const statusBadge = (a: StreamAnalysis): { text: string; cls: string } => {
 export function StreamCard({
   analysis: a,
   selections,
+  patches,
   onResolve,
   onUnresolve,
   onStartChange,
+  onAddPatch,
+  onRemovePatch,
 }: StreamCardProps) {
   const badge = statusBadge(a)
   const conflictGroups = a.groups.filter((g) => g.isConflict)
+  const streamPatches = [...patches].sort((x, y) => x.sequence - y.sequence)
+
+  // 缺口补录编辑器状态：当前编辑的缺号、输入文本与就地错误
+  const [editingGap, setEditingGap] = useState<number | null>(null)
+  const [patchText, setPatchText] = useState('')
+  const [patchError, setPatchError] = useState<string | null>(null)
+
+  // 缺口集合变化（补录成功、调整起始序号等）时收起编辑器
+  const gapsKey = a.gaps.join(',')
+  useEffect(() => {
+    setEditingGap(null)
+    setPatchText('')
+    setPatchError(null)
+  }, [gapsKey])
+
+  const toggleEditor = (sequence: number) => {
+    if (editingGap === sequence) {
+      setEditingGap(null)
+    } else {
+      setEditingGap(sequence)
+    }
+    setPatchText('')
+    setPatchError(null)
+  }
+
+  const handleSavePatch = () => {
+    if (editingGap === null) return
+    const error = onAddPatch(a.name, editingGap, patchText)
+    if (error) {
+      // JSON 非法或与观测事件占位冲突：就地报错，编辑器保持打开
+      setPatchError(error)
+      return
+    }
+    setEditingGap(null)
+    setPatchText('')
+    setPatchError(null)
+  }
 
   const chosenIdFor = (sequence: number): string | null => {
     const id = selections[resolutionKey(a.name, sequence)]
@@ -65,21 +111,92 @@ export function StreamCard({
 
       {a.gaps.length > 0 && (
         <div className="block gaps-block">
-          <h4>缺口（缺号）</h4>
+          <h4>
+            缺口（缺号）
+            <span className="block-hint">点击缺号可为该序号补录事件载荷</span>
+          </h4>
           <div className="gap-list">
             {a.gaps.map((g) => (
-              <span
+              <button
+                type="button"
                 key={g}
-                className={`gap-chip ${a.blockingGap === g ? 'gap-chip-hot' : ''}`}
+                className={`gap-chip gap-chip-btn ${
+                  a.blockingGap === g ? 'gap-chip-hot' : ''
+                } ${editingGap === g ? 'gap-chip-editing' : ''}`}
                 title={
                   a.blockingGap === g
-                    ? '该缺号阻断其后所有事件'
-                    : '位于阻断点之后'
+                    ? '该缺号阻断其后所有事件，点击补录'
+                    : '位于阻断点之后，点击补录'
                 }
+                onClick={() => toggleEditor(g)}
               >
                 #{g}
                 {a.blockingGap === g ? ' ⛔' : ''}
-              </span>
+              </button>
+            ))}
+          </div>
+          {editingGap !== null && (
+            <div className="patch-editor">
+              <div className="patch-editor-head">
+                补录序号 #{editingGap} 的载荷（任意 JSON 值，保存后立即重算连续前缀）
+              </div>
+              <textarea
+                className="patch-input"
+                rows={3}
+                spellCheck={false}
+                placeholder='{"id":"a","status":"recovered"}'
+                value={patchText}
+                onChange={(e) => {
+                  setPatchText(e.target.value)
+                  setPatchError(null)
+                }}
+              />
+              {patchError && <p className="patch-error">✖ {patchError}</p>}
+              <div className="patch-actions">
+                <button
+                  type="button"
+                  className="btn btn-primary"
+                  onClick={handleSavePatch}
+                >
+                  保存补录
+                </button>
+                <button
+                  type="button"
+                  className="btn btn-ghost"
+                  onClick={() => toggleEditor(editingGap)}
+                >
+                  取消
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {streamPatches.length > 0 && (
+        <div className="block patch-block">
+          <h4>
+            本地补录
+            <span className="block-hint">
+              与输入事件合并参与去重、前缀与导出；可逐条撤销，重新解析后清空
+            </span>
+          </h4>
+          <div className="patch-list">
+            {streamPatches.map((p) => (
+              <div key={p.sequence} className="patch-item">
+                <div className="patch-item-bar">
+                  <span className="patch-seq">#{p.sequence}</span>
+                  <span className="patch-tag">本地补录</span>
+                  <button
+                    type="button"
+                    className="btn-text"
+                    onClick={() => onRemovePatch(a.name, p.sequence)}
+                  >
+                    撤销补录（回退前缀）
+                  </button>
+                </div>
+                <pre className="payload">{prettyJson(p.payload)}</pre>
+              </div>
             ))}
           </div>
         </div>
@@ -188,8 +305,16 @@ export function StreamCard({
                       </pre>
                     </td>
                     <td className="col-lines">
-                      {linesLabel(ev.lines)}
-                      {ev.lines.length > 1 && <em className="folded">（重复已折叠）</em>}
+                      {ev.lines[0] === 0 ? (
+                        <span className="patch-src">本地补录</span>
+                      ) : (
+                        <>
+                          {linesLabel(ev.lines)}
+                          {ev.lines.length > 1 && (
+                            <em className="folded">（重复已折叠）</em>
+                          )}
+                        </>
+                      )}
                     </td>
                   </tr>
                 ))}
