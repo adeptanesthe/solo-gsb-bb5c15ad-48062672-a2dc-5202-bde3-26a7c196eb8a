@@ -1,8 +1,9 @@
 import { useMemo, useRef, useState } from 'react'
 import type { ChangeEvent } from 'react'
-import type { ExportOrder } from './types'
+import type { BackfillEvent, ExportOrder } from './types'
 import { parseNdjson } from './lib/ndjson'
 import { analyzeAll, groupEvents, resolutionKey } from './lib/model'
+import { checkBackfill, mergeBackfills } from './lib/backfill'
 import { buildExport } from './lib/export'
 import { buildPlan, validatePlanText } from './lib/plan'
 import { StreamCard } from './components/StreamCard'
@@ -20,6 +21,9 @@ export function App() {
   const [starts, setStarts] = useState<Record<string, number>>({})
   // 裁决映射：resolutionKey(stream, sequence) -> 选中候选的稳定 id
   const [selections, setSelections] = useState<Record<string, string>>({})
+  // 本地补录：仅会话内有效，重新解析即清空，不参与修复方案
+  const [backfills, setBackfills] = useState<BackfillEvent[]>([])
+  const backfillIdRef = useRef(1)
   const [order, setOrder] = useState<ExportOrder>('stream')
   const [copied, setCopied] = useState(false)
   const [planBusy, setPlanBusy] = useState(false)
@@ -64,6 +68,8 @@ export function App() {
       }
       return next
     })
+    // 重新解析：本地补录绑定旧数据，一律清空
+    setBackfills([])
     setCopied(false)
     setPlanMessage(null)
   }
@@ -78,6 +84,7 @@ export function App() {
     setParseErrors([])
     setStarts({})
     setSelections({})
+    setBackfills([])
     setCopied(false)
     setPlanMessage(null)
   }
@@ -110,7 +117,49 @@ export function App() {
     setPlanMessage(null)
   }
 
-  const builds = useMemo(() => groupEvents(parsedEvents), [parsedEvents])
+  /**
+   * 保存一条缺口补录。返回 null 表示成功；
+   * 否则返回错误信息（JSON 非法 / 与观测事件占位冲突 / 重复补录），
+   * 由调用方就地展示，状态保持不变。
+   */
+  const handleAddBackfill = (
+    stream: string,
+    sequence: number,
+    payloadText: string,
+  ): string | null => {
+    if (backfills.some((b) => b.stream === stream && b.sequence === sequence)) {
+      return `序号 #${sequence} 已有本地补录，如需更换请先撤销`
+    }
+    const result = checkBackfill(stream, sequence, payloadText, parsedEvents)
+    if (!result.ok) return result.message
+    setBackfills((prev) => [
+      ...prev,
+      {
+        id: backfillIdRef.current++,
+        stream,
+        sequence,
+        payload: result.payload,
+        raw: result.raw,
+      },
+    ])
+    setCopied(false)
+    setPlanMessage(null)
+    return null
+  }
+
+  /** 逐条撤销补录；撤销后连续前缀随重算同步回退 */
+  const handleRemoveBackfill = (id: number) => {
+    setBackfills((prev) => prev.filter((b) => b.id !== id))
+    setCopied(false)
+    setPlanMessage(null)
+  }
+
+  // 补录与原始事件合并，统一参与去重/冲突/前缀/导出计算
+  const mergedEvents = useMemo(
+    () => mergeBackfills(parsedEvents, backfills),
+    [parsedEvents, backfills],
+  )
+  const builds = useMemo(() => groupEvents(mergedEvents), [mergedEvents])
   const analyses = useMemo(
     () => analyzeAll(builds, starts, selections),
     [builds, starts, selections],
@@ -319,6 +368,10 @@ export function App() {
               <span className="stat-label">被阻断流</span>
             </div>
             <div className="stat">
+              <span className="stat-num">{backfills.length}</span>
+              <span className="stat-label">本地补录</span>
+            </div>
+            <div className="stat">
               <span className="stat-num num-ok">{summary.prefixCount}</span>
               <span className="stat-label">可导出事件</span>
             </div>
@@ -328,7 +381,7 @@ export function App() {
             <div className="panel-head">
               <h2>2. 逐流检查缺口与冲突</h2>
               <p className="panel-hint">
-                选择冲突版本或撤销选择、调整起始序号后，连续前缀会立即重新计算
+                选择冲突版本或撤销选择、调整起始序号、补录缺口后，连续前缀会立即重新计算
               </p>
             </div>
             <div className="stream-list">
@@ -337,9 +390,12 @@ export function App() {
                   key={a.name}
                   analysis={a}
                   selections={selections}
+                  backfills={backfills.filter((b) => b.stream === a.name)}
                   onResolve={handleResolve}
                   onUnresolve={handleUnresolve}
                   onStartChange={handleStartChange}
+                  onAddBackfill={handleAddBackfill}
+                  onRemoveBackfill={handleRemoveBackfill}
                 />
               ))}
             </div>
@@ -350,7 +406,7 @@ export function App() {
               <h2>3. 修复方案导入 / 导出</h2>
               <p className="panel-hint">
                 方案 JSON 含版本、数据指纹（合法事件多重集的 SHA-256）、各流起始序号与所选候选稳定标识；
-                行重排不影响导入，但事件重复次数或内容变化会导致指纹失配
+                行重排不影响导入，但事件重复次数或内容变化会导致指纹失配；本地补录不写入方案
               </p>
             </div>
             <div className="plan-actions">
@@ -440,6 +496,7 @@ export function App() {
             <li>同流同序号且载荷结构相同的重复项自动折叠。</li>
             <li>同流同序号但载荷结构不同 → 冲突，选择一个版本后才放行；可随时撤销。</li>
             <li>缺号或未裁决冲突会阻断该位置之后的全部事件。</li>
+            <li>缺口区可就地补录缺失序号的事件（任意 JSON payload），补录立即参与重算，可逐条撤销。</li>
             <li>导出仅包含每条流从起始序号开始的已确认连续前缀。</li>
           </ol>
         </section>

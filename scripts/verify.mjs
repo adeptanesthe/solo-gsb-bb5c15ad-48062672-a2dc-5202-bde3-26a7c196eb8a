@@ -4,6 +4,7 @@ import { parseNdjson } from '../src/lib/ndjson.ts'
 import { groupEvents, analyzeStream, analyzeAll, resolutionKey } from '../src/lib/model.ts'
 import { buildExport } from '../src/lib/export.ts'
 import { deepEqual, stableStringify } from '../src/lib/compare.ts'
+import { checkBackfill, mergeBackfills } from '../src/lib/backfill.ts'
 import {
   buildPlan,
   canonicalizeEvents,
@@ -248,6 +249,75 @@ check('失效裁决视为未裁决', a1.blockedByConflict && a1.prefix.length ==
   const bad = await validatePlanText('{bad', events)
   check('拒绝时不产出可应用状态', bad.ok === false && bad.applied === undefined)
   check('拒绝时调用方状态未动', JSON.stringify(starts) === before)
+}
+
+// 20. 本地补录：就地校验、合并重算、逐条撤销回退、导出与方案隔离
+{
+  // 校验失败情形：空文本 / 非法 JSON / 与观测事件占位冲突
+  check('补录空 payload 被拒', checkBackfill('s1', 3, '   ', events).ok === false)
+  check('补录非法 JSON 被拒', checkBackfill('s1', 3, '{bad', events).ok === false)
+  const occupied = checkBackfill('s1', 4, '{"x":1}', events)
+  check('补录与观测事件占位冲突被拒', occupied.ok === false)
+  check('占位冲突错误信息含序号', !occupied.ok && occupied.message.includes('#4'))
+
+  // 合法补录：缺号 3，任意 JSON 值均可
+  const bfCheck = checkBackfill('s1', 3, '{"v":3}', events)
+  check('合法补录通过', bfCheck.ok === true)
+  check('基本类型 payload 也可补录', checkBackfill('s1', 3, '42', events).ok === true)
+
+  // 合并后参与统一计算：补上阻断点，前缀继续推进
+  const bf = [{ id: 1, stream: 's1', sequence: 3, payload: bfCheck.payload, raw: bfCheck.raw }]
+  const merged = mergeBackfills(events, bf)
+  check('补录合并进事件池', merged.length === events.length + 1)
+  const lastEv = merged[merged.length - 1]
+  check('补录事件带 origin 标记且行号为 0', lastEv.origin === 'backfill' && lastEv.line === 0)
+  const mBuilds = groupEvents(merged)
+  const ms1 = mBuilds.get('s1')
+  check('补录计入流统计', ms1.backfillEvents === 1 && ms1.totalEvents === s1.totalEvents + 1)
+  check('补录组标记来源', ms1.groups.find((g) => g.sequence === 3).fromBackfill === true)
+
+  // 未裁决冲突不受补录影响，仍在 #1 阻断
+  let ma = analyzeStream(ms1, 1, {})
+  check('补录不改变未裁决阻断', ma.blockedByConflict && ma.prefix.length === 0)
+
+  // 裁决 #1 后：缺 3 已补，前缀推进到流尾 #4
+  ma = analyzeStream(ms1, 1, sel1)
+  check('补录后前缀推进过原阻断点', ma.prefix.map((e) => e.sequence).join() === '1,2,3,4')
+  check('前缀中补录事件标记来源', ma.prefix[2].sequence === 3 && ma.prefix[2].fromBackfill === true)
+  check('前缀中观测事件不标记补录', ma.prefix[0].fromBackfill === false)
+  check('补录后该流无阻断', !ma.blockedByGap && !ma.blockedByConflict)
+  check('补录后缺口列表清空', ma.gaps.length === 0)
+
+  // 导出包含补录事件
+  const rowsBf = buildExport([ma], 'stream').trim().split('\n').map(JSON.parse)
+  check('导出包含补录事件', rowsBf.length === 4 && rowsBf[2].sequence === 3 && rowsBf[2].payload.v === 3)
+
+  // 撤销补录（回到原始事件）-> 前缀同步回退到缺 3 阻断
+  const reverted = analyzeStream(groupEvents(events).get('s1'), 1, sel1)
+  check('撤销补录后前缀回退', reverted.prefix.map((e) => e.sequence).join() === '1,2')
+  check('撤销后恢复缺号阻断', reverted.blockedByGap && reverted.blockingGap === 3)
+
+  // 补录与原始事件走同一流水线：同序号补录参与去重与冲突
+  const dupBf = [
+    { id: 1, stream: 's1', sequence: 3, payload: { v: 3 }, raw: '{"v":3}' },
+    { id: 2, stream: 's1', sequence: 3, payload: { v: 3 }, raw: '{"v":3}' },
+  ]
+  const dupGroup = groupEvents(mergeBackfills(events, dupBf)).get('s1').groups.find((g) => g.sequence === 3)
+  check('相同补录折叠去重', dupGroup.candidates.length === 1 && dupGroup.candidates[0].lines.length === 2 && !dupGroup.isConflict)
+  const confBf = [
+    { id: 1, stream: 's1', sequence: 3, payload: { v: 3 }, raw: '{"v":3}' },
+    { id: 2, stream: 's1', sequence: 3, payload: { v: 9 }, raw: '{"v":9}' },
+  ]
+  const confBuilds = groupEvents(mergeBackfills(events, confBf))
+  const confGroup = confBuilds.get('s1').groups.find((g) => g.sequence === 3)
+  check('不同补录形成冲突', confGroup.isConflict && confGroup.candidates.length === 2)
+  const confAnalysis = analyzeStream(confBuilds.get('s1'), 1, sel1)
+  check('补录冲突未裁决同样阻断', confAnalysis.blockedByConflict && confAnalysis.blockingConflict === 3)
+
+  // 修复方案仍只绑定输入事件：补录不进入指纹，也不影响方案校验
+  const planBf = await buildPlan(events, { s1: 1, s2: 10 }, selA)
+  check('方案对输入事件校验通过（补录不参与）', (await validatePlanText(JSON.stringify(planBf), events)).ok === true)
+  check('含补录的事件与方案指纹失配', (await validatePlanText(JSON.stringify(planBf), merged)).ok === false)
 }
 
 console.log(failures === 0 ? '\n全部通过 ✔' : `\n${failures} 项失败`)

@@ -2,13 +2,30 @@
 
 /** 一条通过 NDJSON 解析并校验后的输入事件 */
 export interface InputEvent {
-  /** 输入框中的行号（从 1 开始，空行不参与编号，因此即文本行号） */
+  /** 输入框中的行号（从 1 开始，空行不参与编号，因此即文本行号）；本地补录事件为 0 */
   line: number
   stream: string
   sequence: number
   /** 已解析的 JSON 载荷，可以是任意 JSON 值（对象/数组/基本类型） */
   payload: JsonValue
   /** payload 在该行对应的原始 JSON 文本，用于候选展示 */
+  raw: string
+  /** 事件来源：缺省为输入行；'backfill' 表示本地补录 */
+  origin?: 'backfill'
+}
+
+/**
+ * 一条本地补录事件：在缺口区为缺失序号手工补入。
+ * 仅保存在浏览器当前会话中（重新解析即清空），不参与修复方案导入导出；
+ * 与原始事件合并后统一参与去重、冲突、连续前缀与导出计算。
+ */
+export interface BackfillEvent {
+  /** 会话内唯一 id（递增），用于逐条撤销 */
+  id: number
+  stream: string
+  sequence: number
+  payload: JsonValue
+  /** 用户输入的原始 JSON 文本，用于展示 */
   raw: string
 }
 
@@ -42,8 +59,10 @@ export interface Candidate {
   payload: JsonValue
   /** 该载荷第一次出现的原始文本 */
   raw: string
-  /** 具备相同结构载荷的输入行号 */
+  /** 具备相同结构载荷的输入行号（补录事件为 0） */
   lines: number[]
+  /** 该候选是否完全来自本地补录 */
+  fromBackfill: boolean
 }
 
 /** 同一 stream + sequence 的全部观测 */
@@ -51,10 +70,12 @@ export interface SequenceGroup {
   stream: string
   sequence: number
   candidates: Candidate[]
-  /** 所有观测行号（含折叠掉的重复项） */
+  /** 所有观测行号（含折叠掉的重复项；补录事件为 0） */
   allLines: number[]
   /** candidates.length > 1 即冲突 */
   isConflict: boolean
+  /** 该序号的全部事件是否均来自本地补录 */
+  fromBackfill: boolean
 }
 
 /** 构建阶段得到的每个流的分组信息 */
@@ -63,16 +84,20 @@ export interface StreamBuild {
   minSequence: number
   maxSequence: number
   groups: SequenceGroup[]
-  /** 输入中观测到的事件总条数（折叠前） */
+  /** 输入中观测到的事件总条数（折叠前，含本地补录） */
   totalEvents: number
+  /** 其中本地补录的事件条数 */
+  backfillEvents: number
 }
 
 /** 已确认的连续前缀中的一个事件 */
 export interface PrefixEvent {
   sequence: number
   payload: JsonValue
-  /** 来自输入的行号；折叠后可能有多个 */
+  /** 来自输入的行号；折叠后可能有多个（补录事件为 0） */
   lines: number[]
+  /** 该事件是否来自本地补录 */
+  fromBackfill: boolean
 }
 
 /** 单个流在给定起始序号与裁决下的完整分析结果 */
@@ -82,6 +107,8 @@ export interface StreamAnalysis {
   minObserved: number
   maxObserved: number
   totalEvents: number
+  /** 其中本地补录的事件条数 */
+  backfillEvents: number
   groups: SequenceGroup[]
   /** 已确认且连续的前缀事件（从 start 开始） */
   prefix: PrefixEvent[]

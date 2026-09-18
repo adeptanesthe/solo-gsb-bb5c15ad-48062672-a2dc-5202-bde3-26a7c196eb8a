@@ -1,13 +1,23 @@
-import type { StreamAnalysis } from '../types'
+import { useState } from 'react'
+import type { BackfillEvent, StreamAnalysis } from '../types'
 import { resolutionKey } from '../lib/model'
 import { prettyJson } from '../lib/compare'
 
 interface StreamCardProps {
   analysis: StreamAnalysis
   selections: Readonly<Record<string, string>>
+  /** 当前流已保存的本地补录（按序号升序展示） */
+  backfills: BackfillEvent[]
   onResolve: (stream: string, sequence: number, candidateId: string) => void
   onUnresolve: (stream: string, sequence: number) => void
   onStartChange: (stream: string, start: number) => void
+  /** 返回 null 表示保存成功；否则为就地展示的错误信息 */
+  onAddBackfill: (
+    stream: string,
+    sequence: number,
+    payloadText: string,
+  ) => string | null
+  onRemoveBackfill: (id: number) => void
 }
 
 function linesLabel(lines: number[]): string {
@@ -24,17 +34,54 @@ const statusBadge = (a: StreamAnalysis): { text: string; cls: string } => {
 export function StreamCard({
   analysis: a,
   selections,
+  backfills,
   onResolve,
   onUnresolve,
   onStartChange,
+  onAddBackfill,
+  onRemoveBackfill,
 }: StreamCardProps) {
   const badge = statusBadge(a)
   const conflictGroups = a.groups.filter((g) => g.isConflict)
+
+  // 缺口补录编辑器的本地状态：正在编辑的缺号、payload 文本与就地错误
+  const [editingGap, setEditingGap] = useState<number | null>(null)
+  const [gapPayloadText, setGapPayloadText] = useState('')
+  const [gapError, setGapError] = useState<string | null>(null)
+
+  const closeGapEditor = () => {
+    setEditingGap(null)
+    setGapPayloadText('')
+    setGapError(null)
+  }
+
+  const toggleGapEditor = (sequence: number) => {
+    if (editingGap === sequence) {
+      closeGapEditor()
+      return
+    }
+    setEditingGap(sequence)
+    setGapPayloadText('')
+    setGapError(null)
+  }
+
+  const saveGapBackfill = () => {
+    if (editingGap === null) return
+    const error = onAddBackfill(a.name, editingGap, gapPayloadText)
+    if (error) {
+      // JSON 非法或与观测事件占位冲突：就地报错，编辑器保持打开
+      setGapError(error)
+      return
+    }
+    closeGapEditor()
+  }
 
   const chosenIdFor = (sequence: number): string | null => {
     const id = selections[resolutionKey(a.name, sequence)]
     return id ?? null
   }
+
+  const sortedBackfills = [...backfills].sort((x, y) => x.sequence - y.sequence)
 
   return (
     <section className="stream-card">
@@ -58,28 +105,106 @@ export function StreamCard({
             />
           </label>
           <span className="meta-item">观测序号 {a.minObserved}–{a.maxObserved}</span>
-          <span className="meta-item">输入 {a.totalEvents} 条</span>
+          <span className="meta-item">输入 {a.totalEvents - a.backfillEvents} 条</span>
+          {a.backfillEvents > 0 && (
+            <span className="meta-item meta-backfill">本地补录 {a.backfillEvents} 条</span>
+          )}
           <span className="meta-item">已确认前缀 {a.prefix.length} 条</span>
         </div>
       </header>
 
       {a.gaps.length > 0 && (
         <div className="block gaps-block">
-          <h4>缺口（缺号）</h4>
+          <h4>
+            缺口（缺号）
+            <span className="block-hint">点击缺号可为该序号就地补录一条事件</span>
+          </h4>
           <div className="gap-list">
             {a.gaps.map((g) => (
-              <span
+              <button
+                type="button"
                 key={g}
-                className={`gap-chip ${a.blockingGap === g ? 'gap-chip-hot' : ''}`}
+                className={`gap-chip gap-chip-btn ${
+                  a.blockingGap === g ? 'gap-chip-hot' : ''
+                } ${editingGap === g ? 'gap-chip-editing' : ''}`}
                 title={
                   a.blockingGap === g
-                    ? '该缺号阻断其后所有事件'
-                    : '位于阻断点之后'
+                    ? '该缺号阻断其后所有事件，点击补录'
+                    : '位于阻断点之后，点击补录'
                 }
+                onClick={() => toggleGapEditor(g)}
               >
                 #{g}
                 {a.blockingGap === g ? ' ⛔' : ''}
-              </span>
+                <span className="gap-plus">＋</span>
+              </button>
+            ))}
+          </div>
+          {editingGap !== null && a.gaps.includes(editingGap) && (
+            <div className="gap-editor">
+              <div className="gap-editor-head">
+                补录序号 <strong>#{editingGap}</strong>
+                <span className="block-hint">
+                  输入任意 JSON payload，保存后立即参与重算
+                </span>
+              </div>
+              <textarea
+                className="gap-editor-input"
+                rows={3}
+                spellCheck={false}
+                placeholder='例如 {"id":"a","status":"paid"}'
+                value={gapPayloadText}
+                onChange={(e) => {
+                  setGapPayloadText(e.target.value)
+                  setGapError(null)
+                }}
+              />
+              {gapError && <p className="gap-editor-error">✖ {gapError}</p>}
+              <div className="gap-editor-actions">
+                <button
+                  type="button"
+                  className="btn btn-primary"
+                  onClick={saveGapBackfill}
+                >
+                  保存补录
+                </button>
+                <button
+                  type="button"
+                  className="btn btn-ghost"
+                  onClick={closeGapEditor}
+                >
+                  取消
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {sortedBackfills.length > 0 && (
+        <div className="block backfill-block">
+          <h4>
+            本地补录
+            <span className="block-hint">
+              仅保存在本机当前会话，重新解析即清空；不写入修复方案；可逐条撤销
+            </span>
+          </h4>
+          <div className="backfill-list">
+            {sortedBackfills.map((b) => (
+              <div key={b.id} className="backfill-item">
+                <div className="backfill-bar">
+                  <span className="backfill-seq">#{b.sequence}</span>
+                  <span className="backfill-tag">本地补录</span>
+                  <button
+                    type="button"
+                    className="btn-text"
+                    onClick={() => onRemoveBackfill(b.id)}
+                  >
+                    撤销该补录
+                  </button>
+                </div>
+                <pre className="payload">{prettyJson(b.payload)}</pre>
+              </div>
             ))}
           </div>
         </div>
@@ -108,7 +233,11 @@ export function StreamCard({
                     {chosenId && !isHot && (
                       <span className="resolved-tag">已裁决</span>
                     )}
-                    <span className="line-hint">输入行：{linesLabel(g.allLines)}</span>
+                    <span className="line-hint">
+                      {g.fromBackfill
+                        ? '本地补录'
+                        : `输入行：${linesLabel(g.allLines)}`}
+                    </span>
                   </div>
                   <div className="candidate-grid">
                     {g.candidates.map((c, idx) => {
@@ -136,7 +265,11 @@ export function StreamCard({
                             >
                               ×{c.lines.length}
                             </span>
-                            <span className="line-hint">行 {linesLabel(c.lines)}</span>
+                            <span className="line-hint">
+                              {c.fromBackfill
+                                ? '本地补录'
+                                : `行 ${linesLabel(c.lines)}`}
+                            </span>
                           </div>
                           <pre className="payload">{prettyJson(c.payload)}</pre>
                         </div>
@@ -188,8 +321,16 @@ export function StreamCard({
                       </pre>
                     </td>
                     <td className="col-lines">
-                      {linesLabel(ev.lines)}
-                      {ev.lines.length > 1 && <em className="folded">（重复已折叠）</em>}
+                      {ev.fromBackfill ? (
+                        <em className="backfill-inline">本地补录</em>
+                      ) : (
+                        <>
+                          {linesLabel(ev.lines)}
+                          {ev.lines.length > 1 && (
+                            <em className="folded">（重复已折叠）</em>
+                          )}
+                        </>
+                      )}
                     </td>
                   </tr>
                 ))}

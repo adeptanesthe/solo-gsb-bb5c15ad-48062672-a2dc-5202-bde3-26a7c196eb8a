@@ -25,16 +25,18 @@ function foldEvents(events: InputEvent[]): Candidate[] {
     const existing = candidates.find((c) => c.id === id)
     if (existing) {
       existing.lines.push(ev.line)
+      existing.fromBackfill = existing.fromBackfill && ev.origin === 'backfill'
     } else {
       candidates.push({
         id,
         payload: ev.payload,
         raw: ev.raw,
         lines: [ev.line],
+        fromBackfill: ev.origin === 'backfill',
       })
     }
   }
-  // 让候选顺序稳定：按首次出现行号（输入顺序）
+  // 让候选顺序稳定：按首次出现行号（输入顺序；补录行号为 0，排在最前）
   candidates.sort((a, b) => a.lines[0] - b.lines[0])
   return candidates
 }
@@ -72,6 +74,8 @@ export function groupEvents(events: InputEvent[]): Map<string, StreamBuild> {
         for (let j = i + 1; j < candidates.length; j++) {
           if (deepEqual(candidates[i].payload, candidates[j].payload)) {
             candidates[i].lines.push(...candidates[j].lines)
+            candidates[i].fromBackfill =
+              candidates[i].fromBackfill && candidates[j].fromBackfill
             candidates.splice(j, 1)
             j--
           }
@@ -84,6 +88,7 @@ export function groupEvents(events: InputEvent[]): Map<string, StreamBuild> {
         candidates,
         allLines: seqEvents.map((e) => e.line).sort((a, b) => a - b),
         isConflict: candidates.length > 1,
+        fromBackfill: seqEvents.every((e) => e.origin === 'backfill'),
       }
     })
 
@@ -93,6 +98,7 @@ export function groupEvents(events: InputEvent[]): Map<string, StreamBuild> {
       maxSequence: sequences[sequences.length - 1],
       groups,
       totalEvents: streamEvents.length,
+      backfillEvents: streamEvents.filter((e) => e.origin === 'backfill').length,
     })
   }
 
@@ -156,6 +162,7 @@ export function analyzeStream(
         sequence: seq,
         payload: chosen.payload,
         lines: chosen.lines,
+        fromBackfill: chosen.fromBackfill,
       })
     } else {
       const only = group.candidates[0]
@@ -163,6 +170,7 @@ export function analyzeStream(
         sequence: seq,
         payload: only.payload,
         lines: only.lines,
+        fromBackfill: only.fromBackfill,
       })
     }
 
@@ -188,6 +196,7 @@ export function analyzeStream(
     minObserved: build.minSequence,
     maxObserved: build.maxSequence,
     totalEvents: build.totalEvents,
+    backfillEvents: build.backfillEvents,
     groups: build.groups,
     prefix,
     nextExpected: seq,
